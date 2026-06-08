@@ -1,12 +1,12 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
-from astrbot.api import logger  # 使用 astrbot 提供的 logger 接口
+from astrbot.api import logger
 from .config import FID, SPACE, BASE_URL, HEADERS, GET_STATUS, NOTICE_URL, QRCODE_PATH, COOKIES_PATH, NOTICE_LIST_PATH, \
-    DATA_DIR, UMO_PATH, PROXIES
+    DATA_DIR, UMO_PATH
 import aiohttp
 import time
 import re
-from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, http_proxy
+from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read
 import pickle
 from pathlib import Path
 import asyncio
@@ -25,14 +25,14 @@ class ChaoXingPlugin(Star):
         self._have_new_notice = False
         self._umo = None
 
-    # 获取用于请求登录页面的refer
-    def _creat_refer(self):
+    def _create_refer(self):
+        """生成带时间戳的refer，用于请求登录页面"""
         t = str(int(time.time() * 1000))
         refer = f"http://i.chaoxing.com/base?t={t}"
         return refer
 
-    # 请求登录页面获取uuid和enc
     async def _get_uuid_enc(self, session, refer):
+        """获取登录页面中服务器生成的uuid、enc和图片地址"""
         url = f'{BASE_URL}/login?fid={FID}&refer={refer}&space={SPACE}'
         response = await get_request(session, url, headers=HEADERS, Method="GET")
         print(response)
@@ -59,6 +59,7 @@ class ChaoXingPlugin(Star):
             return None
 
     async def _get_qrcode(self, session, img_url):
+        """获取并保存二维码"""
         response = await get_request(session, img_url, headers=HEADERS, Method="GET")
         if response is None:
             logger.error("获取二维码失败")
@@ -71,8 +72,8 @@ class ChaoXingPlugin(Star):
         except Exception as e:
             logger.error(f"二维码保存失败: {e}")
 
-    # 登陆时轮询登录状态，获取cookies
     async def _get_status(self, session, refer, uuid, enc):
+        """在登陆时获取登录状态并且登录成功后获取cookies"""
         url = f'{BASE_URL}/{GET_STATUS}'
         get_status_header = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -96,6 +97,7 @@ class ChaoXingPlugin(Star):
         return await response.json()
 
     def _save_cookies(self, session):
+        """保存cookies到data目录"""
         try:
             cookies_dict = {}
             for cookie in session.cookie_jar:
@@ -108,6 +110,7 @@ class ChaoXingPlugin(Star):
             logger.error(f"保存cookies时出错,{e}")
 
     async def _get_notice_list(self, session):
+        """获取通知列表"""
         data = {
             "type": 2,
             "notice_type": '',
@@ -142,8 +145,8 @@ class ChaoXingPlugin(Star):
             return await fetch_json(res)
         return await res.json()
 
-    # 解析通知列表
     def _parse_notice_list(self, notice_res):
+        """解析通知列表"""
         title = ''
         content = ''
         try:
@@ -183,10 +186,9 @@ class ChaoXingPlugin(Star):
         except Exception as e:
             logger.error(f"解析通知时出错,{e}")
 
-    # 生命周期：调用插件前
     async def initialize(self):
-        """初始化插件，创建session"""
-        self.refer = self._creat_refer()
+        """插件初始化：创建 session、加载 cookies、启动通知轮询"""
+        self.refer = self._create_refer()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         jar = aiohttp.CookieJar()
         self.session = aiohttp.ClientSession(cookie_jar=jar)
@@ -201,16 +203,23 @@ class ChaoXingPlugin(Star):
                     logger.info("本地cookies加载成功")
             except Exception as e:
                 logger.error(f"本地cookies加载失败:{e}")
-        logger.info("初始化session成功")
+        logger.warning("未发现本地cookies")
+        self.is_cookies = False
 
         # 启动后台轮询获取消息
         if self.is_cookies:
             self._notice_task = asyncio.create_task(self._get_notices_loop())
             logger.info("已开启通知列表监听")
 
-    # 获取cookies
+    async def terminate(self):
+        """插件卸载时关闭 session 并取消后台任务。"""
+        await self.session.close()
+        if self._notice_task and not self._notice_task.done():
+            self._notice_task.cancel()
+
     @filter.command("获取二维码")
     async def login_by_qr(self, event: AstrMessageEvent):
+        """二维码登录流程：下载二维码 -> 轮询登录 -> 保存 cookies。"""
         refer = self.refer
         # 如果未发现本地cookies
         if not self.is_cookies:
@@ -284,17 +293,18 @@ class ChaoXingPlugin(Star):
     # 删除登录状态
     @filter.command("重置登录状态")
     async def del_cookies(self, event: AstrMessageEvent):
+        """删除本地 cookies，重置登录状态。"""
         if self.is_cookies:
             Path(COOKIES_PATH).unlink(missing_ok=True)
             self.is_cookies = False
             logger.warning("已删除cookies")
             yield event.plain_result("登录状态已经重置")
             await asyncio.sleep(1)
-        yield event.plain_result("登录状态已经重置")
 
     # 启动消息监听
     @filter.command("开启通知推送")
     async def start_get_notice(self, event: AstrMessageEvent):
+        """手动开启通知后台轮询。"""
         if not self.is_cookies:
             yield event.plain_result("请先登录")
             return
@@ -305,15 +315,10 @@ class ChaoXingPlugin(Star):
     # 手动关闭消息通知
     @filter.command("关闭通知推送")
     async def close_get_notices(self, event: AstrMessageEvent):
+        """手动关闭通知后台轮询。"""
         if not self.is_cookies:
             yield event.plain_result("请先登录")
             return
         if self._notice_task and not self._notice_task.done():
             self._notice_task.cancel()
             yield event.plain_result("已关闭通知推送")
-
-    # 卸载插件时自动释放资源
-    async def terminate(self):
-        await self.session.close()
-        if self._notice_task and not self._notice_task.done():
-            self._notice_task.cancel()

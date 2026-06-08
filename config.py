@@ -1,38 +1,39 @@
-"""该插件所需常量"""
+"""超星（学习通）插件所需的全部常量与路径配置"""
+
 from pathlib import Path
 
+# 登录配置
+FID = '12'          # 登录机构编号（默认 12）
+SPACE = '2'         # 登录场景标识
 
-# 登录机构(默认为12)
-FID = '12'
-SPACE = '2'
-# 通用头部
+# 通用请求头
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
-    "X-Requested-With": "XMLHttpRequest"
+    "X-Requested-With": "XMLHttpRequest",
 }
-# 基础地址
-BASE_URL = 'https://passport2.chaoxing.com'
-# 登陆时获取登录状态以及登录成功后获取cookies的api
-GET_STATUS = "getauthstatus/v2"
-# 获取通知列表的api
-NOTICE_URL = "https://notice.chaoxing.com/pc/notice/getNoticeList"
-# 超时时间
-TIMEOUT = 10
-# 代理ip配置
-PROXIES = [
+
+# 接口地址
+BASE_URL = 'https://passport2.chaoxing.com'          # 登录服务基础地址
+GET_STATUS = "getauthstatus/v2"                      # 登录状态/获取 cookies 的 API 路径
+NOTICE_URL = "https://notice.chaoxing.com/pc/notice/getNoticeList"  # 通知列表 API
+
+# 请求超时与代理
+TIMEOUT = 10         # HTTP 请求超时时间（秒）
+PORT = ''            # 代理端口（预留）
+PROXIES = [          # 代理 IP 池（备用）
     "223.15.228.134:9797",
     "49.91.12.54:3128",
     "118.239.191.113:8080",
-    "220.175.227.219:8080"
+    "220.175.227.219:8080",
 ]
-PORT = ''
-# 路径
+
+# 本地存储路径
 PLUGIN_DIR = Path(__file__).parent
-DATA_DIR = PLUGIN_DIR / 'data'
-QRCODE_PATH = str(DATA_DIR / 'qrcode.png')
-NOTICE_LIST_PATH = str(DATA_DIR / 'notices_dict.json')
-COOKIES_PATH = str(DATA_DIR / 'cookies.pkl')
-UMO_PATH = str(DATA_DIR / 'umo.txt')
+DATA_DIR = PLUGIN_DIR / 'data'                        # 数据目录
+QRCODE_PATH = str(DATA_DIR / 'qrcode.png')            # 登录二维码图片
+NOTICE_LIST_PATH = str(DATA_DIR / 'notices_dict.json')  # 上次通知记录（uuid 集合）
+COOKIES_PATH = str(DATA_DIR / 'cookies.pkl')          # 持久化 cookies
+UMO_PATH = str(DATA_DIR / 'umo.txt')                  # 绑定用户的消息标识

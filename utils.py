@@ -1,16 +1,19 @@
 import aiohttp
-import asyncio
 import json
 from astrbot.api import logger
 from functools import wraps
 from zoneinfo import ZoneInfo
 from datetime import datetime
-import random
 import asyncio
+from bs4 import BeautifulSoup
+import chardet
 
 
 # 发送请求
 async def get_request(session, url, data=None, headers=None, Method="GET", TIMEOUT=10):
+    """
+    发送HTTP请求，不走代理途径，session接受会话，url接受目标网址
+    """
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     try:
         if Method == "GET":
@@ -28,6 +31,7 @@ async def get_request(session, url, data=None, headers=None, Method="GET", TIMEO
 
 # 走代理
 class GetRequest:
+    """发送HTTP请求，走代理途径"""
     def __init__(self, url, session, proxy_url, **kwargs):
         self.proxy_url = proxy_url
         self.kwargs = kwargs
@@ -36,6 +40,9 @@ class GetRequest:
         self.resp = None
 
     async def __aenter__(self):
+        """
+        走代理发送请求
+        """
         try:
             method = self.kwargs.get('method', 'GET')
             headers = self.kwargs.get('headers', {})
@@ -58,8 +65,8 @@ class GetRequest:
             self.resp.close()
 
 
-# 定时器，在无通知时间段停止请求
 def time_limit(s_h: int, s_m: int, e_h: int, e_m: int):
+    """定时器，在无通知时间段停止请求"""
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -82,8 +89,8 @@ def time_limit(s_h: int, s_m: int, e_h: int, e_m: int):
     return decorator
 
 
-# 普通文件的读取和写入
 def safe_read(fileName, default=None):
+    """普通文件的读取"""
     try:
         with open(fileName, 'r') as f:
             return f.read()
@@ -93,6 +100,7 @@ def safe_read(fileName, default=None):
 
 
 def safe_write(fileName, content, mode='w'):
+    """普通文件的写入"""
     try:
         with open(fileName, mode) as f:
             f.write(content)
@@ -102,8 +110,8 @@ def safe_write(fileName, content, mode='w'):
         return False
 
 
-# json的读取和写入
 def json_read(fileName, default=None, coding='utf-8'):
+    """json的读取"""
     try:
         with open(fileName, 'r', encoding=coding) as f:
             return json.load(f)
@@ -113,6 +121,7 @@ def json_read(fileName, default=None, coding='utf-8'):
 
 
 def json_write(fileName, content, mode='w', coding='utf-8'):
+    """json的写入"""
     try:
         with open(fileName, mode, encoding=coding) as f:
             json.dump(content, f, ensure_ascii=False)
@@ -122,8 +131,8 @@ def json_write(fileName, content, mode='w', coding='utf-8'):
         return False
 
 
-# 处理网页回复的json
 async def fetch_json(aioHttpResObj=None):
+    """处理网页返回的json"""
     try:
         if aioHttpResObj is None:
             logger.error("返回的对象为None")
@@ -136,3 +145,40 @@ async def fetch_json(aioHttpResObj=None):
     except Exception as e:
         logger.error(f"解析json失败，{e}")
     return None
+
+
+class FetchHtml:
+    """解析登录网站"""
+    def __init__(self, aioHttpResObj=None):
+        self._res = aioHttpResObj
+        self._soup = None
+        self._status = aioHttpResObj.status
+
+    async def _parse_html(self):
+        """
+        通过bs4解析html网页，会自动匹配编码
+        """
+        if self._status != 200:
+            raise ValueError(f"http状态码非200,状态码为{self._status}")
+        raw_bytes = await self._res.read()
+        detected = chardet.detect(raw_bytes)
+        encoding = detected['encoding'] or 'utf-8'
+        html = raw_bytes.decode(encoding)
+        self._soup = BeautifulSoup(html, encoding=encoding)
+
+    async def fetch_id(self, _id, *attrs_name):
+        """
+        通过id获取该id所属标签其他属性的值，_id接受id的值，*attrs_name目的属性
+        """
+        if self._soup is None:
+            await self._parse_html()
+        tag = self._soup.find_all(id=_id)
+        if len(tag) > 1 or len(tag) == 0:
+            raise ValueError("存在多个重复id或者不存在id")
+        target = tag[0]
+        attrs = target.attrs
+        result = {}
+        for item in attrs_name:
+            if item in attrs:
+                result[item] = target.get(item)
+        return result
