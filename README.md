@@ -1,14 +1,31 @@
-# astrbot-plugin-helloworld
+# 超星学习通通知助手
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+一个面向 AstrBot 的超星学习通通知推送插件。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 插件优势
 
-# Supports
+- **自动通知推送**：后台定时轮询学习通通知列表，新通知实时推送到聊天。
+- **二维码登录**：通过扫描学习通二维码完成登录，无需手动配置 Cookie。
+- **Cookie 持久化**：登录成功后自动保存 Cookie，重启后自动加载，无需重复登录。
+- **通知去重**：基于通知 UUID 进行去重，避免重复推送。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 指令
+
+```
+/获取二维码        获取学习通登录二维码，1分钟内扫码完成登录
+/重置登录状态      清除本地 Cookie，需重新扫码登录
+/开启通知推送      手动开启后台通知轮询
+/关闭通知推送      手动关闭后台通知轮询
+```
+
+## 配置
+
+无需额外配置。插件启动后执行 `/获取二维码` 扫码登录即可。
+
+登录成功后插件会自动开启通知轮询，间隔 25~35 秒随机轮询一次，新通知将自动推送到发起登录的会话中。
+
+## 安全说明
+
+- 扫码登录过程中，二维码和登录状态请求会发送到 `https://passport2.chaoxing.com`，即超星学习通官方服务器。
+- Cookie 以 pickle 格式保存在本地 `data` 目录下，请勿泄露该文件。
+- 通知内容仅推送到发起登录的会话，不会转发到其他渠道。
