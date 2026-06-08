@@ -21,6 +21,14 @@ GET_STATUS = "getauthstatus/v2"
 NOTICE_URL = "https://notice.chaoxing.com/pc/notice/getNoticeList"
 # 超时时间
 TIMEOUT = 10
+# 代理ip配置
+PROXIES = [
+    "223.15.228.134:9797",
+    "49.91.12.54:3128",
+    "118.239.191.113:8080",
+    "220.175.227.219:8080"
+]
+PORT = ''
 # 路径
 PLUGIN_DIR = Path(__file__).parent
 DATA_DIR = PLUGIN_DIR / 'data'

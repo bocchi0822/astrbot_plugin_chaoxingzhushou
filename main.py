@@ -2,11 +2,11 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, Mess
 from astrbot.api.star import Context, Star
 from astrbot.api import logger  # 使用 astrbot 提供的 logger 接口
 from .config import FID, SPACE, BASE_URL, HEADERS, GET_STATUS, NOTICE_URL, QRCODE_PATH, COOKIES_PATH, NOTICE_LIST_PATH, \
-    DATA_DIR, UMO_PATH
+    DATA_DIR, UMO_PATH, PROXIES
 import aiohttp
 import time
 import re
-from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read
+from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, http_proxy
 import pickle
 from pathlib import Path
 import asyncio

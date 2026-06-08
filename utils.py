@@ -5,6 +5,8 @@ from astrbot.api import logger
 from functools import wraps
 from zoneinfo import ZoneInfo
 from datetime import datetime
+import random
+import asyncio
 
 
 # 发送请求
@@ -22,6 +24,38 @@ async def get_request(session, url, data=None, headers=None, Method="GET", TIMEO
     except Exception as e:
         logger.error(f"请求失败: {e}")
         return None
+
+
+# 走代理
+class GetRequest:
+    def __init__(self, url, session, proxy_url, **kwargs):
+        self.proxy_url = proxy_url
+        self.kwargs = kwargs
+        self.session = session
+        self.url = url
+        self.resp = None
+
+    async def __aenter__(self):
+        try:
+            method = self.kwargs.get('method', 'GET')
+            headers = self.kwargs.get('headers', {})
+            timeout = aiohttp.ClientTimeout(total=self.kwargs.get('timeout', 10))
+            if method == 'GET':
+                self.resp = await self.session.get(self.url, headers=headers, timeout=timeout, proxy=self.proxy_url)
+                self.resp.raise_for_status()
+                return self.resp
+            if method == 'POST':
+                data = self.kwargs.get('data', {})
+                self.resp = await self.session.post(self.url, data=data, headers=headers, timeout=timeout, proxy=self.proxy_url)
+                self.resp.raise_for_status()
+                return self.resp
+        except Exception as e:
+            logger.error(f"请求失败:{e}")
+            return None
+
+    async def __aexit__(self, *args):
+        if self.resp:
+            self.resp.close()
 
 
 # 定时器，在无通知时间段停止请求
