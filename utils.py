@@ -3,7 +3,7 @@ import json
 from astrbot.api import logger
 from functools import wraps
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 from bs4 import BeautifulSoup
 import chardet
@@ -34,6 +34,7 @@ async def get_request(session, url, data=None, headers=None, Method="GET", TIMEO
 # 走代理
 class GetRequest:
     """发送HTTP请求，走代理途径"""
+
     def __init__(self, url, session, proxy_url, **kwargs):
         self.proxy_url = proxy_url
         self.kwargs = kwargs
@@ -55,7 +56,8 @@ class GetRequest:
                 return self.resp
             if method == 'POST':
                 data = self.kwargs.get('data', {})
-                self.resp = await self.session.post(self.url, data=data, headers=headers, timeout=timeout, proxy=self.proxy_url)
+                self.resp = await self.session.post(self.url, data=data, headers=headers, timeout=timeout,
+                                                    proxy=self.proxy_url)
                 self.resp.raise_for_status()
                 return self.resp
         except Exception as e:
@@ -69,6 +71,7 @@ class GetRequest:
 
 def time_limit(s_h: int, s_m: int, e_h: int, e_m: int):
     """定时器，在无通知时间段停止请求"""
+
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -151,6 +154,7 @@ async def fetch_json(aioHttpResObj=None):
 
 class FetchHtml:
     """解析登录网站"""
+
     def __init__(self, aioHttpResObj=None):
         self._res = aioHttpResObj
         self._soup = None
@@ -186,54 +190,55 @@ class FetchHtml:
         return result
 
 
-class SaveDataByTinyDb:
+class NoticesDB:
     """
-    通过jql保持信息
+    通过tinydb来管理通知的查询和本地保存
     """
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.db = None
-        self.q = Query()
-        self._isDb = False
+    def __init__(self, notice_res, notices_db_path):
+        self.notice_res = notice_res
+        self.notices_db = TinyDB(Path(notices_db_path))
+        self.notices_db_query = Query()
 
-    def create_db(self):
-        if not self._isDb:
-            self.db = TinyDB(self.db_path)
-            self._isDb = True
-            return self.db
+    def save_notices_db(self):
+        new_count = 0
+        for item in self.notice_res['notices']['list']:
+            record = {
+                "uuid": item["uuid"],
+                "completeTime": item["completeTime"],
+                "content": item["content"],
+                "createrName": item["createrName"],
+                "insertTime": item["insertTime"],
+                "isRead": item["isread"],
+                "sendTime": item["sendTime"],
+                "title": item["title"]
+            }
+            if not self.notices_db.contains(self.notices_db_query.uuid == record["uuid"]):
+                self.notices_db.insert(record)
+                new_count += 1
+        return new_count
 
-    def add_db(self, data: list):
-        if self._isDb:
-            self.db.insert_multiple(data)
-            return True
-        logger.error("请先创建数据表")
-        return False
+    def look_up_notices_by_isRead(self, isRead):
+        isRead = int(isRead)
+        self.notices_db.search(self.notices_db_query.isRead == isRead)
+        return self.notices_db
 
-    def search_db(self, **kwargs):
-        if self._isDb:
-            cond = None
-            for k, v in kwargs.items():
-                c = getattr(self.db, k) == v
-                if cond is None:
-                    cond = c
-                else:
-                    cond = cond & c
-            return self.db.search(cond)
+    def look_up_notices_by_timestamp(self, startTime, endTime):
+        dt_s = datetime.strptime(startTime, "%Y-%m-%d-%H-%M")
+        dt_e = datetime.strptime(endTime, "%Y-%m-%d-%H-%M")
+        startTimestamp = int(dt_s.timestamp()*1000)
+        endTimestamp = int(dt_e.timestamp()*1000)
+        oneDayTimestamp = 1*24*60*60*1000
+        if startTimestamp > endTimestamp:
+            logger.error("开始时间不能大于结束时间")
+            return []
+        if endTimestamp - startTimestamp <= oneDayTimestamp:
+            logger.error("可查询的最短时间间隔为一天")
+            return []
+        return self.notices_db.search((self.notices_db_query.insertTime > startTimestamp) &
+                                      (self.notices_db_query.insertTime < endTimestamp))
 
-    def delete_db(self, **kwargs):
-        if self._isDb:
-            cond = None
-            for k, v in kwargs.items():
-                c = getattr(self.db, k) == v
-                if cond is None:
-                    cond = c
-                else:
-                    cond = cond & c
-            self.db.delete(cond)
-            return True
+    def look_up_all(self):
+        return self.notices_db.all()
 
-    def update_db(self, **kwargs):
-        pass
-
-
-
+    def close_db(self):
+        self.notices_db.close()

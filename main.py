@@ -5,12 +5,13 @@ from .config import FID, SPACE, BASE_URL, HEADERS, GET_STATUS, NOTICE_URL, QRCOD
     DATA_DIR, UMO_PATH
 import aiohttp
 import time
-import re
-from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, FetchHtml
+from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, FetchHtml, \
+    NoticesDB
 import pickle
 from pathlib import Path
 import asyncio
 import random
+from tinydb import TinyDB, Query
 
 
 class ChaoXingPlugin(Star):
@@ -24,6 +25,7 @@ class ChaoXingPlugin(Star):
         self._notice_task = None
         self._have_new_notice = False
         self._umo = None
+        self.notices_db = None
 
     def _create_refer(self):
         """生成带时间戳的refer，用于请求登录页面"""
@@ -142,44 +144,15 @@ class ChaoXingPlugin(Star):
             return await fetch_json(res)
         return await res.json()
 
-    def _parse_notice_list(self, notice_res):
+    async def _parse_notice_list(self, notice_res):
         """解析通知列表"""
-        title = ''
-        content = ''
         try:
-            notice_list = notice_res["notices"]["list"]
-            notices_dict = {}
-            if not notice_res["notices"]["list"]:
-                return None
-            for item in notice_list:
-                # 去掉换行
-                cleaned_title = item["title"].replace("\r", "").replace("\n", "")
-                cleaned_content = item["content"].replace("\r", "").replace("\n", "")
-                notices_dict[item["uuid"]] = [cleaned_title, cleaned_content]
-            # 记录本次通知的唯一id的集合
-            current_uuid = set(notices_dict.keys())
-            # 读取上次通知的唯一id的集合
-            old_uuid = set()
-            old_notices_dict = Path(NOTICE_LIST_PATH)
-            if old_notices_dict.exists():
-                old_uuid = set(json_read(old_notices_dict).keys())
-            # 获取新增的通知的uuid
-            new_uuid = current_uuid - old_uuid
-            if new_uuid:
-                for uuid in new_uuid:
-                    title = notices_dict[uuid][0]
-                    content = notices_dict[uuid][1]
-                    logger.info(f"新通知：标题【{title}】, 内容【{content}】")
-                    # 保存本次通知
-                    json_write(NOTICE_LIST_PATH, notices_dict)
-                    # 更新状态
-                    self._have_new_notice = True
-                return title, content
-            else:
-                logger.debug("无新通知")
-                # 更新状态
-                self._have_new_notice = False
-                return None
+            self.notices_db = NoticesDB(notice_res, NOTICE_LIST_PATH)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, self.notices_db.save_notices_db)
+            logger.info(f"新增了{result}条通知")
+            return result
+
         except Exception as e:
             logger.error(f"解析通知时出错,{e}")
 
@@ -200,9 +173,9 @@ class ChaoXingPlugin(Star):
                     logger.info("本地cookies加载成功")
             except Exception as e:
                 logger.error(f"本地cookies加载失败:{e}")
-        logger.warning("未发现本地cookies")
+        else:
+            logger.warning("未发现本地cookies")
         self.is_cookies = False
-
         # 启动后台轮询获取消息
         if self.is_cookies:
             self._notice_task = asyncio.create_task(self._get_notices_loop())
@@ -277,10 +250,9 @@ class ChaoXingPlugin(Star):
             try:
                 notice_res = await self._get_notice_list(self.session)
                 if notice_res:
-                    result = self._parse_notice_list(notice_res)
+                    result = await self._parse_notice_list(notice_res)
                     if result:
-                        title, content = result
-                        chain = MessageChain().message(f"学习通通知\n标题：{title}\n内容：{content}")
+                        chain = MessageChain().message(f"学习通通知\n标题：{result}")
                         await self.context.send_message(self._umo, chain)
             except asyncio.CancelledError:
                 break
@@ -319,3 +291,9 @@ class ChaoXingPlugin(Star):
         if self._notice_task and not self._notice_task.done():
             self._notice_task.cancel()
             yield event.plain_result("已关闭通知推送")
+
+    @filter.command("调试")
+    async def debug(self, event: AstrMessageEvent):
+        notice_res = await self._get_notice_list(self.session)
+        result = await self._parse_notice_list(notice_res)
+        logger.info(result)
