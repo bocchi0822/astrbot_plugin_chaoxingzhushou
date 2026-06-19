@@ -6,7 +6,7 @@ from .config import FID, SPACE, BASE_URL, HEADERS, GET_STATUS, NOTICE_URL, QRCOD
 import aiohttp
 import time
 import re
-from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read
+from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, FetchHtml
 import pickle
 from pathlib import Path
 import asyncio
@@ -36,27 +36,24 @@ class ChaoXingPlugin(Star):
         url = f'{BASE_URL}/login?fid={FID}&refer={refer}&space={SPACE}'
         response = await get_request(session, url, headers=HEADERS, Method="GET")
         print(response)
+        fetchData = FetchHtml(response)
         if response is None:
             logger.error("获取登录页面失败")
             return None
         login_html = await response.text()
         # 解析uuid和enc
-        result = re.findall(r'<input type="hidden" value="([^"]+)" id="(uuid|enc)"/>', login_html, re.S)
+        uuid = await fetchData.fetch_id("uuid", "value")
+        enc = await fetchData.fetch_id("enc", "value")
         # 获取qrcode的地址
-        img_match = re.search(r'<img src="([^"]+)" id="quickCode">', login_html, re.S)
-        if not result:
+        img_match = await fetchData.fetch_id("quickCode", "src")
+        if not uuid or not enc:
             logger.error(f"uuid/enc未匹配到，HTML片段: {login_html[:2000]}")
             return None
         if not img_match:
             logger.error(f"二维码图片未匹配到，HTML片段: {login_html[:2000]}")
             return None
-        if result and img_match:
-            uuid = result[0][0]
-            enc = result[1][0]
-            img_url = f'{BASE_URL}{img_match.group(1)}'
-            return uuid, enc, img_url
-        else:
-            return None
+        img_url = f'{BASE_URL}{img_match['src']}'
+        return uuid['value'], enc['value'], img_url
 
     async def _get_qrcode(self, session, img_url):
         """获取并保存二维码"""
@@ -254,7 +251,7 @@ class ChaoXingPlugin(Star):
                     # 自动启动通知监听
                     if not self._notice_task or self._notice_task.done():
                         self._notice_task = asyncio.create_task(self._get_notices_loop())
-                        logger.error("已开启通知列表监听")
+                        logger.warning("已开启通知列表监听")
                     break
                 if turn >= max_turn:
                     logger.warning("登录超时，请重新获取二维码")

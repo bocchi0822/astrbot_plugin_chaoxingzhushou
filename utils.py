@@ -7,6 +7,8 @@ from datetime import datetime
 import asyncio
 from bs4 import BeautifulSoup
 import chardet
+from tinydb import TinyDB, Query
+from pathlib import Path
 
 
 # 发送请求
@@ -164,7 +166,7 @@ class FetchHtml:
         detected = chardet.detect(raw_bytes)
         encoding = detected['encoding'] or 'utf-8'
         html = raw_bytes.decode(encoding)
-        self._soup = BeautifulSoup(html, encoding=encoding)
+        self._soup = BeautifulSoup(html, "html.parser", from_encoding=encoding)
 
     async def fetch_id(self, _id, *attrs_name):
         """
@@ -182,3 +184,56 @@ class FetchHtml:
             if item in attrs:
                 result[item] = target.get(item)
         return result
+
+
+class SaveDataByTinyDb:
+    """
+    通过jql保持信息
+    """
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.db = None
+        self.q = Query()
+        self._isDb = False
+
+    def create_db(self):
+        if not self._isDb:
+            self.db = TinyDB(self.db_path)
+            self._isDb = True
+            return self.db
+
+    def add_db(self, data: list):
+        if self._isDb:
+            self.db.insert_multiple(data)
+            return True
+        logger.error("请先创建数据表")
+        return False
+
+    def search_db(self, **kwargs):
+        if self._isDb:
+            cond = None
+            for k, v in kwargs.items():
+                c = getattr(self.db, k) == v
+                if cond is None:
+                    cond = c
+                else:
+                    cond = cond & c
+            return self.db.search(cond)
+
+    def delete_db(self, **kwargs):
+        if self._isDb:
+            cond = None
+            for k, v in kwargs.items():
+                c = getattr(self.db, k) == v
+                if cond is None:
+                    cond = c
+                else:
+                    cond = cond & c
+            self.db.delete(cond)
+            return True
+
+    def update_db(self, **kwargs):
+        pass
+
+
+
