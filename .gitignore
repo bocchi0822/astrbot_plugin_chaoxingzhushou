@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 本插件专用：运行时数据目录
+# 内含 cookies.pkl（学习通账号会话凭据）、notices_dict.json（通知内容）、
+# umo.txt（绑定会话标识）、qrcode.png（登录二维码），一律不得提交
+data/
+
+# JetBrains IDE 本地配置
+.idea/
