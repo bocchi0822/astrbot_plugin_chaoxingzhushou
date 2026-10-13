@@ -191,6 +191,8 @@ class ChaoXingPlugin(Star):
     async def login_by_qr(self, event: AstrMessageEvent):
         """二维码登录流程：下载二维码 -> 轮询登录 -> 保存 cookies。"""
         refer = self.refer
+        # 本轮登录先复位标志位，避免上一次登录成功后的残留状态造成误判
+        self.logged_in = False
         # 如果未发现本地cookies
         if not self.is_cookies:
             login_info = await self._get_uuid_enc(self.session, refer)
@@ -225,7 +227,8 @@ class ChaoXingPlugin(Star):
                     if not self._notice_task or self._notice_task.done():
                         self._notice_task = asyncio.create_task(self._get_notices_loop())
                         logger.warning("已开启通知列表监听")
-                    break
+                    # 登录成功，直接结束本指令，避免继续执行到下方“重新登录”的提示
+                    return
                 if turn >= max_turn:
                     logger.warning("登录超时，请重新获取二维码")
                     yield event.plain_result("登录超时，请重新获取二维码")
