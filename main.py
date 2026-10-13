@@ -156,6 +156,30 @@ class ChaoXingPlugin(Star):
         except Exception as e:
             logger.error(f"解析通知时出错,{e}")
 
+    def _start_notices_loop(self):
+        """启动通知轮询后台任务，已在运行时不重复创建"""
+        if self._notice_task and not self._notice_task.done():
+            return False
+        self._notice_task = asyncio.create_task(self._get_notices_loop())
+        logger.info("已开启通知列表监听")
+        return True
+
+    async def _stop_notices_loop(self):
+        """取消通知轮询后台任务并等待其真正退出"""
+        task = self._notice_task
+        self._notice_task = None
+        if task is None or task.done():
+            return False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"停止通知轮询时出错:{e}")
+        logger.info("已停止通知列表监听")
+        return True
+
     async def initialize(self):
         """插件初始化：创建 session、加载 cookies、启动通知轮询"""
         self.refer = self._create_refer()
@@ -183,9 +207,9 @@ class ChaoXingPlugin(Star):
 
     async def terminate(self):
         """插件卸载时关闭 session 并取消后台任务。"""
-        await self.session.close()
-        if self._notice_task and not self._notice_task.done():
-            self._notice_task.cancel()
+        await self._stop_notices_loop()
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     @filter.command("获取二维码")
     async def login_by_qr(self, event: AstrMessageEvent):
@@ -224,9 +248,7 @@ class ChaoXingPlugin(Star):
                     safe_write(Path(UMO_PATH), self._umo)
                     self.logged_in = True
                     # 自动启动通知监听
-                    if not self._notice_task or self._notice_task.done():
-                        self._notice_task = asyncio.create_task(self._get_notices_loop())
-                        logger.warning("已开启通知列表监听")
+                    self._start_notices_loop()
                     # 登录成功，直接结束本指令，避免继续执行到下方“重新登录”的提示
                     return
                 if turn >= max_turn:
@@ -258,20 +280,22 @@ class ChaoXingPlugin(Star):
                         chain = MessageChain().message(f"学习通通知\n标题：{result}")
                         await self.context.send_message(self._umo, chain)
             except asyncio.CancelledError:
-                break
+                # 结束循环并让任务真正进入 done 状态，便于下次重新创建
+                return
             except Exception as e:
                 logger.error(f"通知轮询出错{e}")
 
     # 删除登录状态
     @filter.command("重置登录状态")
     async def del_cookies(self, event: AstrMessageEvent):
-        """删除本地 cookies，重置登录状态。"""
-        if self.is_cookies:
-            Path(COOKIES_PATH).unlink(missing_ok=True)
-            self.is_cookies = False
-            logger.warning("已删除cookies")
-            yield event.plain_result("登录状态已经重置")
-            await asyncio.sleep(1)
+        """删除本地 cookies，重置登录状态并停止后台轮询。"""
+        await self._stop_notices_loop()
+        self.is_cookies = False
+        self.logged_in = False
+        self.session.cookie_jar.clear()
+        Path(COOKIES_PATH).unlink(missing_ok=True)
+        logger.warning("已删除cookies并停止通知轮询")
+        yield event.plain_result("登录状态已经重置，通知推送已停止")
 
     # 启动消息监听
     @filter.command("开启通知推送")
@@ -280,20 +304,19 @@ class ChaoXingPlugin(Star):
         if not self.is_cookies:
             yield event.plain_result("请先登录")
             return
-        if not self._notice_task or self._notice_task.done():
-            self._notice_task = asyncio.create_task(self._get_notices_loop())
+        if self._start_notices_loop():
             yield event.plain_result("已开启,可以使用[/关闭通知推送]来关闭")
+        else:
+            yield event.plain_result("通知推送已经在运行中")
 
     # 手动关闭消息通知
     @filter.command("关闭通知推送")
     async def close_get_notices(self, event: AstrMessageEvent):
         """手动关闭通知后台轮询。"""
-        if not self.is_cookies:
-            yield event.plain_result("请先登录")
-            return
-        if self._notice_task and not self._notice_task.done():
-            self._notice_task.cancel()
+        if await self._stop_notices_loop():
             yield event.plain_result("已关闭通知推送")
+        else:
+            yield event.plain_result("通知推送当前未在运行")
 
     @filter.command("调试")
     async def debug(self, event: AstrMessageEvent):
