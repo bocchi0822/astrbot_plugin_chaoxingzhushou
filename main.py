@@ -2,9 +2,12 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from .config import FID, SPACE, BASE_URL, HEADERS, GET_STATUS, NOTICE_URL, QRCODE_PATH, COOKIES_PATH, NOTICE_LIST_PATH, \
-    DATA_DIR, UMO_PATH
+    DATA_DIR, UMO_PATH, YEAR
 import aiohttp
 import time
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, FetchHtml, \
     NoticesDB
 import pickle
@@ -12,6 +15,11 @@ from pathlib import Path
 import asyncio
 import random
 from tinydb import TinyDB, Query
+
+# 从通知正文（item["content"]，纯文本）中提取字段用的正则。
+# 正文的字段分隔方式不固定：作业类用 \r 分行，任务类用逗号连接。
+RE_COURSE_NAME = re.compile(r"课程名称[:：]\s*([^,\r\n]+)")
+RE_ASSIGN_TIMES = re.compile(r"开始时间[:：]\s*([\d\-: ]+?)\s*[\r\n]+\s*结束时间[:：]\s*([\d\-: ]+)")
 
 
 class ChaoXingPlugin(Star):
@@ -124,7 +132,7 @@ class ChaoXingPlugin(Star):
             "endTime": '',
             "gKw": '',
             "gName": '',
-            "year": 2026,
+            "year": YEAR,
             "tag": '',
             "fidsCode": '',
             "queryFolderNoticePrevYear": 0,
@@ -136,16 +144,146 @@ class ChaoXingPlugin(Star):
             logger.error("通知列表为None")
             return None
         # 判断登录状态
-        cookies_path = Path(COOKIES_PATH)
-        content_type = res.headers.get('Content-Type')
+        content_type = res.headers.get('Content-Type') or ''
         if res.status == 302 or "text/html" in content_type:
             logger.warning("cookie失效，请重新登录")
-            cookies_path.unlink(missing_ok=True)
+            Path(COOKIES_PATH).unlink(missing_ok=True)
             self.is_cookies = False
             return None
-        if "application/json" not in content_type:
-            return await fetch_json(res)
-        return await res.json()
+        payload = await fetch_json(res)
+        if payload is None:
+            logger.error(f"通知接口未返回合法JSON，状态码{res.status}")
+            return None
+        # 接口异常时会返回不含 notices 的数据，提前校验避免下游 KeyError
+        if not isinstance(payload, dict) or not isinstance(payload.get('notices'), dict) \
+                or not isinstance(payload['notices'].get('list'), list):
+            logger.error(f"通知接口返回结构异常，缺少notices.list字段，响应片段：{str(payload)[:300]}")
+            return None
+        return payload
+
+    # 通知内容格式化：作业与公告分开推送
+
+    def _notice_kind(self, item):
+        """判定通知类型：作业/考试类，还是普通公告"""
+        return "作业" if item.get("sourceType") == 14 else "公告"
+
+    def _course_name(self, item):
+        """从正文里取课程名称，取不到时返回空串
+
+        正文片段形如“课程名称：针灸学”。少数通知（如“作业结束提醒”）不含该字段，
+        tag 里虽然带 courseId，但那是课程ID不是课程名，因此不做兜底，
+        此时返回空串，调用方不会输出“课程：”这一行。
+        """
+        match = RE_COURSE_NAME.search(str(item.get("content") or ""))
+        if not match:
+            return ""
+        return match.group(1).strip()
+
+    def _assign_times(self, item):
+        """取出作业的截止时间文本；正文里没有起止时间时返回 None
+
+        正文格式形如：作业名称：xxx\\r开始时间：2026-10-14 11:07\\r结束时间：2026-10-17 12:07
+        """
+        m = RE_ASSIGN_TIMES.search(str(item.get("content") or ""))
+        return m.group(2).strip() if m else None
+
+    def _deadline_text(self, end_str):
+        """把截止时间格式化成“截止：xxx”或“已截止”，过滤 2035 这类占位值"""
+        try:
+            end = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
+        except (TypeError, ValueError):
+            return ""
+        now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        left = (end - now).total_seconds()
+        if left < 0:
+            return f"已截止（{end_str}）"
+        days = left / 86400
+        # 超星对部分作业会把结束时间填成十几年后，这种不是真实截止时间
+        if days > 365:
+            return ""
+        if days >= 1:
+            return f"截止：{end_str}（剩{days:.1f}天）"
+        hours = left / 3600
+        if hours >= 1:
+            return f"截止：{end_str}（剩{hours:.1f}小时）"
+        return f"截止：{end_str}（剩{left / 60:.0f}分钟）"
+
+    def _is_personal_sender(self, item):
+        """判断通知是否由个人发送
+
+        source=1 为个人发送（如任课老师），source=2 为机构或系统群发。
+        """
+        return item.get("source") == 1
+
+    def _format_one_notice(self, item):
+        """把单条通知格式化为待推送的文本块
+
+        作业类：类型 + 标题 + 截止时间 + 课程名称。这类通知的正文就是“作业名称/开始时间/
+        结束时间”几行字段，与已输出内容重复，因此不再附加正文。
+        公告类：在以上基础上附加正文。正文首行常与标题相同，其中的“课程名称：”一行
+        也已单独输出，这两类行会被跳过。
+        个人发送的通知会在类型后标出发送者，与机构/系统通知区分。
+        """
+        kind = self._notice_kind(item)
+        title = str(item.get("title") or "（无标题）").strip()
+        course = self._course_name(item)
+        header = f"【{kind}】"
+        if self._is_personal_sender(item):
+            header = f"【{kind}·{item.get('createrName')}】"
+        lines = [f"{header}{title}"]
+
+        end_str = self._assign_times(item)
+        deadline = self._deadline_text(end_str) if end_str else ""
+        if deadline:
+            lines.append(deadline)
+        if course:
+            lines.append(f"课程：{course}")
+
+        # 公告类把正文补在下方。正文是纯文本，字段之间以转义的 \r\n 分隔
+        if kind == "公告":
+            body = str(item.get("content") or "").replace("\\r", "\n").replace("\\n", "\n").strip()
+            for line in body.splitlines():
+                line = line.strip()
+                # 跳过空行，以及已经作为标题或课程名输出过的行，避免重复
+                if not line or RE_COURSE_NAME.match(line) or line in (title, deadline):
+                    continue
+                lines.append(line)
+        return "\n".join(lines)
+
+    def _build_push_text(self, notices):
+        """把本轮新增通知拼成一条消息，作业与公告分区展示"""
+        # 先剔除非法项，再按 uuid 去重，最后按时间倒序（最新的排最前）
+        if not notices:
+            return "学习通新通知 0 条"
+        valid = []
+        for item in notices:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("uuid"):
+                continue
+            valid.append(item)
+
+        seen = set()
+        unique = []
+        for item in valid:
+            uuid = str(item.get("uuid"))
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+            unique.append(item)
+        unique.sort(key=lambda i: i.get("insertTime") or 0, reverse=True)
+
+        assignments = [i for i in unique if self._notice_kind(i) == "作业"]
+        announcements = [i for i in unique if self._notice_kind(i) == "公告"]
+
+        blocks = [f"学习通新通知 {len(unique)} 条"]
+        if assignments:
+            blocks.append(f"—— 作业 {len(assignments)} 条 ——")
+            blocks.extend(self._format_one_notice(i) for i in assignments)
+        if announcements:
+            blocks.append(f"—— 公告 {len(announcements)} 条 ——")
+            blocks.extend(self._format_one_notice(i) for i in announcements)
+        return "\n\n".join(blocks)
 
     async def _parse_notice_list(self, notice_res):
         """解析通知列表"""
@@ -285,9 +423,27 @@ class ChaoXingPlugin(Star):
             try:
                 notice_res = await self._get_notice_list(self.session)
                 if notice_res:
+                    # 先记录入库前已有的 uuid，用于区分本轮真正新增的通知
+                    existing = NoticesDB([], NOTICE_LIST_PATH)
+                    try:
+                        before = set()
+                        for record in existing.look_up_all():
+                            before.add(str(record.get("uuid")))
+                    finally:
+                        existing.close_db()
                     result = await self._parse_notice_list(notice_res)
                     if result:
-                        chain = MessageChain().message(f"学习通通知\n标题：{result}")
+                        new_items = []
+                        for item in notice_res["notices"]["list"]:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("uuid")) not in before:
+                                new_items.append(item)
+                        if new_items:
+                            text = self._build_push_text(new_items)
+                        else:
+                            text = f"学习通新通知 {result} 条"
+                        chain = MessageChain().message(text)
                         await self.context.send_message(self._umo, chain)
             except asyncio.CancelledError:
                 # 结束循环并让任务真正进入 done 状态，便于下次重新创建

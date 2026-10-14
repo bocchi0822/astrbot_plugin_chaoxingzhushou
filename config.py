@@ -1,10 +1,15 @@
 """超星（学习通）插件所需的全部常量与路径配置"""
 
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # 登录配置
 FID = '12'          # 登录机构编号（默认 12）
 SPACE = '2'         # 登录场景标识
+
+# 通知列表请求使用的年份，随当前年份自动变化，避免跨年后失效
+YEAR = datetime.now(ZoneInfo("Asia/Shanghai")).year
 
 # 通用请求头
 HEADERS = {
