@@ -37,11 +37,10 @@ class ChaoXingPlugin(Star):
         """获取登录页面中服务器生成的uuid、enc和图片地址"""
         url = f'{BASE_URL}/login?fid={FID}&refer={refer}&space={SPACE}'
         response = await get_request(session, url, headers=HEADERS, Method="GET")
-        print(response)
-        fetchData = FetchHtml(response)
         if response is None:
             logger.error("获取登录页面失败")
             return None
+        fetchData = FetchHtml(response)
         login_html = await response.text()
         # 解析uuid和enc
         uuid = await fetchData.fetch_id("uuid", "value")
@@ -54,7 +53,8 @@ class ChaoXingPlugin(Star):
         if not img_match:
             logger.error(f"二维码图片未匹配到，HTML片段: {login_html[:2000]}")
             return None
-        img_url = f'{BASE_URL}{img_match['src']}'
+        # 拼接二维码完整地址；此处内层用单引号，避免依赖 Python 3.12+ 才支持的同类引号嵌套
+        img_url = f"{BASE_URL}{img_match['src']}"
         return uuid['value'], enc['value'], img_url
 
     async def _get_qrcode(self, session, img_url):
@@ -90,7 +90,10 @@ class ChaoXingPlugin(Star):
             "forbidotherlogin": 0,
         }
         response = await get_request(session, url, data, headers=get_status_header, Method="POST")
-        content_type = response.headers.get("Content-Type", "")
+        if response is None:
+            logger.error("获取登录状态失败，请求无响应")
+            return None
+        content_type = response.headers.get("Content-Type") or ''
         if 'application/json' not in content_type:
             return await fetch_json(response)
         return await response.json()
@@ -238,6 +241,9 @@ class ChaoXingPlugin(Star):
                 if login_status is None:
                     logger.error("get_status无响应")
                     break
+                if not isinstance(login_status, dict) or 'status' not in login_status:
+                    logger.error(f"登录状态响应格式异常:{login_status}")
+                    break
                 if login_status['status']:
                     logger.info("登陆成功")
                     yield event.plain_result("登陆成功！")
@@ -269,6 +275,10 @@ class ChaoXingPlugin(Star):
 
     # 获取通知
     async def _get_notices_loop(self):
+        # 没有绑定的会话时无法推送，直接结束，避免每轮都因 _umo 为空抛错
+        if not self._umo:
+            logger.error("未找到推送目标会话(umo)，通知轮询未启动")
+            return
         while True:
             second = random.uniform(25, 35)
             await asyncio.sleep(second)
@@ -321,5 +331,9 @@ class ChaoXingPlugin(Star):
     @filter.command("调试")
     async def debug(self, event: AstrMessageEvent):
         notice_res = await self._get_notice_list(self.session)
+        if not notice_res:
+            yield event.plain_result("获取通知列表失败，请检查登录状态或查看日志")
+            return
         result = await self._parse_notice_list(notice_res)
         logger.info(result)
+        yield event.plain_result(f"调试完成，新增{result}条通知")

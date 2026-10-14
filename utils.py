@@ -218,11 +218,15 @@ class NoticesDB:
         return new_count
 
     def look_up_notices_by_isRead(self, isRead):
+        """按已读/未读状态查询，返回查询结果列表"""
         isRead = int(isRead)
-        self.notices_db.search(self.notices_db_query.isRead == isRead)
-        return self.notices_db
+        return self.notices_db.search(self.notices_db_query.isRead == isRead)
 
     def look_up_notices_by_timestamp(self, startTime, endTime):
+        """按时间区间查询通知，区间不得短于一天
+
+        参数格式：YYYY-MM-DD-HH-MM
+        """
         dt_s = datetime.strptime(startTime, "%Y-%m-%d-%H-%M")
         dt_e = datetime.strptime(endTime, "%Y-%m-%d-%H-%M")
         startTimestamp = int(dt_s.timestamp()*1000)
@@ -231,7 +235,8 @@ class NoticesDB:
         if startTimestamp > endTimestamp:
             logger.error("开始时间不能大于结束时间")
             return []
-        if endTimestamp - startTimestamp <= oneDayTimestamp:
+        # 短于一天才拒绝；恰好一天是允许的最短区间
+        if endTimestamp - startTimestamp < oneDayTimestamp:
             logger.error("可查询的最短时间间隔为一天")
             return []
         return self.notices_db.search((self.notices_db_query.insertTime > startTimestamp) &
