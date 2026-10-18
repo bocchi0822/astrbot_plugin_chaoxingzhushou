@@ -2,12 +2,13 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from .config import FID, SPACE, BASE_URL, HEADERS, GET_STATUS, NOTICE_URL, QRCODE_PATH, COOKIES_PATH, NOTICE_LIST_PATH, \
-    DATA_DIR, UMO_PATH, YEAR
+    DATA_DIR, UMO_PATH, YEAR, ACTIVE_LIST_URL, ACTIVE_FID, ACTIVE_TYPES, ACTIVE_URGENT_TYPES
 import aiohttp
 import time
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 from .utils import get_request, time_limit, safe_write, json_write, json_read, fetch_json, safe_read, FetchHtml, \
     NoticesDB
 import pickle
@@ -16,10 +17,15 @@ import asyncio
 import random
 from tinydb import TinyDB, Query
 
-# 从通知正文（item["content"]，纯文本）中提取字段用的正则。
-# 正文的字段分隔方式不固定：作业类用 \r 分行，任务类用逗号连接。
+# 从通知正文提取字段用的正则
+# 作业类以 \r 分行，任务类以逗号分隔
 RE_COURSE_NAME = re.compile(r"课程名称[:：]\s*([^,\r\n]+)")
 RE_ASSIGN_TIMES = re.compile(r"开始时间[:：]\s*([\d\-: ]+?)\s*[\r\n]+\s*结束时间[:：]\s*([\d\-: ]+)")
+
+# 活动轮询间隔（秒）
+ACTIVE_POLL_SECONDS = 20
+# 单轮最多轮询的课程数，避免课程多时请求放大
+ACTIVE_MAX_COURSES = 5
 
 
 class ChaoXingPlugin(Star):
@@ -31,6 +37,8 @@ class ChaoXingPlugin(Star):
         self.refer = None
         self.logged_in = False
         self._notice_task = None
+        self._active_task = None
+        self._validate_task = None
         self._have_new_notice = False
         self._umo = None
         self.notices_db = None
@@ -61,7 +69,7 @@ class ChaoXingPlugin(Star):
         if not img_match:
             logger.error(f"二维码图片未匹配到，HTML片段: {login_html[:2000]}")
             return None
-        # 拼接二维码完整地址；此处内层用单引号，避免依赖 Python 3.12+ 才支持的同类引号嵌套
+        # 拼接二维码完整地址
         img_url = f"{BASE_URL}{img_match['src']}"
         return uuid['value'], enc['value'], img_url
 
@@ -119,9 +127,9 @@ class ChaoXingPlugin(Star):
         except Exception as e:
             logger.error(f"保存cookies时出错,{e}")
 
-    async def _get_notice_list(self, session):
-        """获取通知列表"""
-        data = {
+    def _notice_query_data(self):
+        """通知列表接口的固定请求参数"""
+        return {
             "type": 2,
             "notice_type": '',
             "lastValue": '',
@@ -139,7 +147,11 @@ class ChaoXingPlugin(Star):
             "filterSenderPuids": '',
             "filterTags": '',
         }
-        res = await get_request(session, NOTICE_URL, data=data, headers=HEADERS, Method="POST")
+
+    async def _get_notice_list(self, session):
+        """获取通知列表"""
+        res = await get_request(session, NOTICE_URL, data=self._notice_query_data(),
+                                headers=HEADERS, Method="POST")
         if res is None:
             logger.error("通知列表为None")
             return None
@@ -154,12 +166,220 @@ class ChaoXingPlugin(Star):
         if payload is None:
             logger.error(f"通知接口未返回合法JSON，状态码{res.status}")
             return None
-        # 接口异常时会返回不含 notices 的数据，提前校验避免下游 KeyError
+        # 接口异常时会返回不含 notices 的数据
         if not isinstance(payload, dict) or not isinstance(payload.get('notices'), dict) \
                 or not isinstance(payload['notices'].get('list'), list):
             logger.error(f"通知接口返回结构异常，缺少notices.list字段，响应片段：{str(payload)[:300]}")
             return None
         return payload
+
+    async def _get_active_list(self, course_id, class_id):
+        """获取课程活动列表
+
+        course_id 取自通知的 tag 字段，class_id 取自 receiverArray[].clazzId。
+        返回 data.activeList 数组；请求失败或结构异常时返回 None。
+        """
+        params = {
+            "fid": ACTIVE_FID,
+            "classId": class_id,
+            "courseId": course_id,
+            "_": int(time.time() * 1000),
+        }
+        url = f"{ACTIVE_LIST_URL}?{urlencode(params)}"
+        res = await get_request(self.session, url, headers=HEADERS, Method="GET")
+        if res is None:
+            logger.error(f"获取活动列表失败：courseId={course_id} classId={class_id}")
+            return None
+        payload = await fetch_json(res)
+        if not isinstance(payload, dict):
+            logger.error(f"活动接口返回非JSON内容，状态码{res.status}")
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("activeList"), list):
+            logger.error(f"活动接口返回结构异常，响应片段：{str(payload)[:200]}")
+            return None
+        return data["activeList"]
+
+    def _active_targets(self):
+        """从通知记录中取出待轮询的 (courseId, classId) 组合"""
+        db = NoticesDB([], NOTICE_LIST_PATH)
+        try:
+            records = db.look_up_all()
+        finally:
+            db.close_db()
+        targets = []
+        seen = set()
+        for record in records:
+            course_id = str(record.get("course_id") or "")
+            class_id = str(record.get("class_id") or "")
+            if not course_id or not class_id:
+                continue
+            key = (course_id, class_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(key)
+        return targets[:ACTIVE_MAX_COURSES]
+
+    def _course_name_by_id(self, course_id):
+        """按课程 ID 从通知记录中取课程名称"""
+        db = NoticesDB([], NOTICE_LIST_PATH)
+        try:
+            records = db.look_up_all()
+        finally:
+            db.close_db()
+        for record in records:
+            if str(record.get("course_id") or "") == str(course_id):
+                name = self._course_name(record)
+                if name:
+                    return name
+        return ""
+
+    def _format_active(self, record, course_name):
+        """把一条活动格式化为待推送的文本"""
+        active_type = record.get("active_type")
+        label = ACTIVE_TYPES.get(active_type, "活动")
+        urgent = active_type in ACTIVE_URGENT_TYPES
+        lines = ["🔴 学习通活动提醒" if urgent else "学习通活动提醒"]
+        lines.append(f"【{label}】{record.get('name') or ''}".rstrip())
+        remaining = str(record.get("remaining") or "")
+        if remaining:
+            lines.append(remaining)
+        if course_name:
+            lines.append(f"课程：{course_name}")
+        return "\n".join(lines)
+
+    async def _get_actives_loop(self):
+        """轮询课程活动，把新出现的活动推送到绑定会话"""
+        if not self._umo:
+            logger.error("未找到推送目标会话(umo)，活动轮询未启动")
+            return
+        targets = self._active_targets()
+        if not targets:
+            logger.warning("通知记录中没有 courseId/classId，活动轮询未启动")
+            return
+        db = NoticesDB([], NOTICE_LIST_PATH)
+        # 轮询开始之前就已存在的活动只入库，不推送
+        watching_since = int(time.time() * 1000)
+        try:
+            while True:
+                await asyncio.sleep(ACTIVE_POLL_SECONDS)
+                try:
+                    for course_id, class_id in targets:
+                        actives = await self._get_active_list(course_id, class_id)
+                        if not actives:
+                            continue
+                        course_name = self._course_name_by_id(course_id)
+                        for record in db.save_actives(actives, course_id, class_id):
+                            active_id = record.get("active_id")
+                            started = int(record.get("start_time") or 0)
+                            if record.get("active_type") == 45 or record.get("status") != 1 \
+                                    or started < watching_since:
+                                db.mark_active_pushed(active_id)
+                                continue
+                            text = self._format_active(record, course_name)
+                            await self.context.send_message(self._umo, MessageChain().message(text))
+                            db.mark_active_pushed(active_id)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.error(f"活动轮询出错{e}")
+        finally:
+            db.close_db()
+
+    def _start_actives_loop(self):
+        """启动活动轮询后台任务，已在运行时不重复创建"""
+        if self._active_task and not self._active_task.done():
+            return False
+        self._active_task = asyncio.create_task(self._get_actives_loop())
+        logger.info("已开启课程活动监听")
+        return True
+
+    async def _stop_actives_loop(self):
+        """取消活动轮询后台任务并等待其退出"""
+        task = self._active_task
+        self._active_task = None
+        if task is None or task.done():
+            return False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"停止活动轮询时出错:{e}")
+        return True
+
+    async def _probe_login(self):
+        """探测本地 cookies 是否仍然有效
+
+        返回 "valid"（有效）、"invalid"（已失效）、"unknown"（网络异常，无法判断）。
+        """
+        res = await get_request(self.session, NOTICE_URL, data=self._notice_query_data(),
+                                headers=HEADERS, Method="POST")
+        if res is None:
+            return "unknown"
+        content_type = res.headers.get('Content-Type') or ''
+        if res.status == 302 or "text/html" in content_type:
+            return "invalid"
+        payload = await fetch_json(res)
+        if payload is None:
+            return "unknown"
+        if not isinstance(payload, dict) or not isinstance(payload.get('notices'), dict) \
+                or not isinstance(payload['notices'].get('list'), list):
+            logger.error(f"登录态探测返回结构异常，响应片段：{str(payload)[:300]}")
+            return "invalid"
+        return "valid"
+
+    async def _validate_login_state(self):
+        """启动时校验本地 cookies 是否仍有效，有效则自动开启通知轮询"""
+        state = await self._probe_login()
+        if state == "valid":
+            self.is_cookies = True
+            logger.info("本地cookies有效，自动开启通知轮询")
+            self._start_notices_loop()
+        elif state == "invalid":
+            self.is_cookies = False
+            self.session.cookie_jar.clear()
+            Path(COOKIES_PATH).unlink(missing_ok=True)
+            logger.warning("本地cookies已失效，已清除，请重新执行[/获取二维码]登录")
+            await self._notify_login_issue(
+                "学习通登录状态已失效，通知推送已停止。\n请重新执行 /获取二维码 扫码登录。"
+            )
+        else:
+            logger.warning("网络异常，无法确认本地cookies是否有效；未自动开启轮询，"
+                           "可稍后手动执行[/开启通知推送]")
+            await self._notify_login_issue(
+                "无法确认学习通登录状态（网络异常），通知推送未自动开启。\n"
+                "可稍后执行 /开启通知推送 重试。"
+            )
+
+    async def _notify_login_issue(self, text):
+        """把登录相关的提示推送到已绑定的会话
+
+        text 为要发送的完整文案。未绑定会话或推送失败时记录日志。
+        """
+        if not self._umo:
+            logger.warning("未绑定会话，无法推送登录状态提示")
+            return
+        try:
+            chain = MessageChain().message(text)
+            await self.context.send_message(self._umo, chain)
+            logger.info("已推送登录状态提示")
+        except Exception as e:
+            logger.error(f"推送登录状态提示失败:{e}")
+
+    async def _cancel_login_check(self):
+        """取消启动时的登录态校验任务（若仍在运行）"""
+        task = self._validate_task
+        self._validate_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     # 通知内容格式化：作业与公告分开推送
 
@@ -168,11 +388,9 @@ class ChaoXingPlugin(Star):
         return "作业" if item.get("sourceType") == 14 else "公告"
 
     def _course_name(self, item):
-        """从正文里取课程名称，取不到时返回空串
+        """从正文的“课程名称：”字段取课程名称，取不到时返回空串
 
-        正文片段形如“课程名称：针灸学”。少数通知（如“作业结束提醒”）不含该字段，
-        tag 里虽然带 courseId，但那是课程ID不是课程名，因此不做兜底，
-        此时返回空串，调用方不会输出“课程：”这一行。
+        正文片段形如“课程名称：针灸学”。
         """
         match = RE_COURSE_NAME.search(str(item.get("content") or ""))
         if not match:
@@ -188,7 +406,7 @@ class ChaoXingPlugin(Star):
         return m.group(2).strip() if m else None
 
     def _deadline_text(self, end_str):
-        """把截止时间格式化成“截止：xxx”或“已截止”，过滤 2035 这类占位值"""
+        """把截止时间格式化成带倒计时的文本，结束时间距今超过一年时返回空串"""
         try:
             end = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
         except (TypeError, ValueError):
@@ -218,11 +436,8 @@ class ChaoXingPlugin(Star):
     def _format_one_notice(self, item):
         """把单条通知格式化为待推送的文本块
 
-        作业类：类型 + 标题 + 截止时间 + 课程名称。这类通知的正文就是“作业名称/开始时间/
-        结束时间”几行字段，与已输出内容重复，因此不再附加正文。
-        公告类：在以上基础上附加正文。正文首行常与标题相同，其中的“课程名称：”一行
-        也已单独输出，这两类行会被跳过。
-        个人发送的通知会在类型后标出发送者，与机构/系统通知区分。
+        作业类输出类型、标题、截止时间、课程名称；公告类在此基础上追加正文各行。
+        个人发送的通知在类型后标出发送者。
         """
         kind = self._notice_kind(item)
         title = str(item.get("title") or "（无标题）").strip()
@@ -239,12 +454,12 @@ class ChaoXingPlugin(Star):
         if course:
             lines.append(f"课程：{course}")
 
-        # 公告类把正文补在下方。正文是纯文本，字段之间以转义的 \r\n 分隔
+        # 公告类追加正文，正文中的转义 \r\n 先还原为换行
         if kind == "公告":
             body = str(item.get("content") or "").replace("\\r", "\n").replace("\\n", "\n").strip()
             for line in body.splitlines():
                 line = line.strip()
-                # 跳过空行，以及已经作为标题或课程名输出过的行，避免重复
+                # 跳过空行及与标题、课程名重复的行
                 if not line or RE_COURSE_NAME.match(line) or line in (title, deadline):
                     continue
                 lines.append(line)
@@ -298,15 +513,17 @@ class ChaoXingPlugin(Star):
             logger.error(f"解析通知时出错,{e}")
 
     def _start_notices_loop(self):
-        """启动通知轮询后台任务，已在运行时不重复创建"""
+        """启动通知与活动轮询后台任务，已在运行时不重复创建"""
         if self._notice_task and not self._notice_task.done():
             return False
         self._notice_task = asyncio.create_task(self._get_notices_loop())
+        self._start_actives_loop()
         logger.info("已开启通知列表监听")
         return True
 
     async def _stop_notices_loop(self):
-        """取消通知轮询后台任务并等待其真正退出"""
+        """取消通知与活动轮询后台任务并等待其真正退出"""
+        await self._stop_actives_loop()
         task = self._notice_task
         self._notice_task = None
         if task is None or task.done():
@@ -322,7 +539,7 @@ class ChaoXingPlugin(Star):
         return True
 
     async def initialize(self):
-        """插件初始化：创建 session、加载 cookies、启动通知轮询"""
+        """插件初始化：创建 session、加载本地 cookies，并在后台校验其有效性"""
         self.refer = self._create_refer()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         jar = aiohttp.CookieJar()
@@ -333,21 +550,22 @@ class ChaoXingPlugin(Star):
             try:
                 with open(COOKIES_PATH, 'rb') as f:
                     cookies_dict = pickle.load(f)
-                    self.session.cookie_jar.update_cookies(cookies_dict)
-                    self.is_cookies = True
-                    logger.info("本地cookies加载成功")
+                self.session.cookie_jar.update_cookies(cookies_dict)
+                self.is_cookies = True
+                logger.info("本地cookies加载成功，开始校验是否仍然有效")
             except Exception as e:
                 logger.error(f"本地cookies加载失败:{e}")
+                self.is_cookies = False
         else:
-            logger.warning("未发现本地cookies")
-        self.is_cookies = False
-        # 启动后台轮询获取消息
+            logger.warning("未发现本地cookies，请先执行[/获取二维码]登录")
+            self.is_cookies = False
+        # 登录态校验在后台任务中执行
         if self.is_cookies:
-            self._notice_task = asyncio.create_task(self._get_notices_loop())
-            logger.info("已开启通知列表监听")
+            self._validate_task = asyncio.create_task(self._validate_login_state())
 
     async def terminate(self):
         """插件卸载时关闭 session 并取消后台任务。"""
+        await self._cancel_login_check()
         await self._stop_notices_loop()
         if self.session and not self.session.closed:
             await self.session.close()
@@ -356,7 +574,7 @@ class ChaoXingPlugin(Star):
     async def login_by_qr(self, event: AstrMessageEvent):
         """二维码登录流程：下载二维码 -> 轮询登录 -> 保存 cookies。"""
         refer = self.refer
-        # 本轮登录先复位标志位，避免上一次登录成功后的残留状态造成误判
+        # 复位登录标志位
         self.logged_in = False
         # 如果未发现本地cookies
         if not self.is_cookies:
@@ -393,7 +611,7 @@ class ChaoXingPlugin(Star):
                     self.logged_in = True
                     # 自动启动通知监听
                     self._start_notices_loop()
-                    # 登录成功，直接结束本指令，避免继续执行到下方“重新登录”的提示
+                    # 登录成功后结束本指令
                     return
                 if turn >= max_turn:
                     logger.warning("登录超时，请重新获取二维码")
@@ -413,7 +631,7 @@ class ChaoXingPlugin(Star):
 
     # 获取通知
     async def _get_notices_loop(self):
-        # 没有绑定的会话时无法推送，直接结束，避免每轮都因 _umo 为空抛错
+        # 未绑定会话时结束轮询
         if not self._umo:
             logger.error("未找到推送目标会话(umo)，通知轮询未启动")
             return
@@ -455,6 +673,8 @@ class ChaoXingPlugin(Star):
     @filter.command("重置登录状态")
     async def del_cookies(self, event: AstrMessageEvent):
         """删除本地 cookies，重置登录状态并停止后台轮询。"""
+        # 启动时的登录态校验若仍在进行，先取消，否则它稍后可能又把登录态置回有效
+        await self._cancel_login_check()
         await self._stop_notices_loop()
         self.is_cookies = False
         self.logged_in = False

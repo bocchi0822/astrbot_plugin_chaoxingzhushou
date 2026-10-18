@@ -25,6 +25,35 @@ BASE_URL = 'https://passport2.chaoxing.com'          # 登录服务基础地址
 GET_STATUS = "getauthstatus/v2"                      # 登录状态/获取 cookies 的 API 路径
 NOTICE_URL = "https://notice.chaoxing.com/pc/notice/getNoticeList"  # 通知列表 API
 
+# 课程活动接口，返回签到、抢答、讨论、选人等全部课程活动
+ACTIVE_LIST_URL = "https://mobilelearn.chaoxing.com/v2/apis/active/student/activelist"
+
+# 活动接口的 GET 参数
+#   fid       机构号，固定为 '0'
+#   classId   班级 ID，取自通知的 receiverArray[].clazzId
+#   courseId  课程 ID，取自通知的 tag 字段去掉 courseId 前缀
+#   _         毫秒时间戳，用于避免缓存
+ACTIVE_FID = '0'
+
+# activeType 与活动类型的对应关系
+ACTIVE_TYPES = {
+    2: "签到",
+    4: "抢答",
+    5: "主题讨论",
+    11: "选人",
+    14: "问卷",
+    23: "评分",
+    35: "分组任务",
+    42: "随堂测试",
+    43: "投票",
+    45: "通知",
+    46: "群聊",
+    80: "抽签",
+}
+
+# 时效较短、需要优先提醒的活动类型
+ACTIVE_URGENT_TYPES = {2, 4, 80}
+
 # 请求超时与代理
 TIMEOUT = 10         # HTTP 请求超时时间（秒）
 PORT = ''            # 代理端口（预留）

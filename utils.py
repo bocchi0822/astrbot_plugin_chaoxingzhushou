@@ -10,6 +10,8 @@ import chardet
 from tinydb import TinyDB, Query
 from pathlib import Path
 
+from .config import NOTICE_LIST_PATH
+
 
 # 发送请求
 async def get_request(session, url, data=None, headers=None, Method="GET", TIMEOUT=10):
@@ -191,36 +193,109 @@ class FetchHtml:
 
 
 class NoticesDB:
+    """本地存储，课程外通知与课程内活动分表保存
+
+    TinyDB 按用途分成三张表：
+      notice  课程外通知，来自通知列表接口，按 uuid 去重
+      active  课程内活动，来自活动接口，按 active_id 去重，并记录是否已推送
+      state   键值状态，如 schema 版本
     """
-    通过tinydb来管理通知的查询和本地保存
-    """
-    def __init__(self, notice_res, notices_db_path):
+
+    SCHEMA_VERSION = 2
+
+    def __init__(self, notice_res=None, notices_db_path=NOTICE_LIST_PATH):
         self.notice_res = notice_res
-        self.notices_db = TinyDB(Path(notices_db_path))
-        self.notices_db_query = Query()
+        self.db = TinyDB(Path(notices_db_path))
+        self.notice_table = self.db.table("notice")
+        self.active_table = self.db.table("active")
+        self.state_table = self.db.table("state")
+        self.query = Query()
+        self._migrate()
+
+    # ---------- 状态与迁移 ----------
+
+    def _get_state(self, key, default=None):
+        record = self.state_table.get(self.query.key == key)
+        return record.get("value") if record else default
+
+    def _set_state(self, key, value):
+        if self.state_table.contains(self.query.key == key):
+            self.state_table.update({"value": value}, self.query.key == key)
+        else:
+            self.state_table.insert({"key": key, "value": value})
+
+    def _migrate(self):
+        """把旧版 _default 表中的通知搬到 notice 表"""
+        if (self._get_state("schema_version") or 0) >= self.SCHEMA_VERSION:
+            return
+        legacy = self.db.table("_default").all()
+        migrated = 0
+        for old in legacy:
+            uuid = str(old.get("uuid") or "")
+            if not uuid or self.notice_table.contains(self.query.uuid == uuid):
+                continue
+            self.notice_table.insert({
+                "uuid": uuid,
+                "title": old.get("title"),
+                "content": old.get("content"),
+                "creater_name": old.get("createrName"),
+                "course_id": "",
+                "class_id": "",
+                "source_type": None,
+                "source": None,
+                "insert_time": old.get("insertTime"),
+                "send_time": old.get("sendTime"),
+                "is_read": old.get("isRead"),
+                "seen_at": old.get("insertTime"),
+            })
+            migrated += 1
+        self._set_state("schema_version", self.SCHEMA_VERSION)
+        if migrated:
+            logger.info(f"通知数据库已迁移{migrated}条旧记录")
+
+    # ---------- 通知 ----------
+
+    @staticmethod
+    def _notice_record(item):
+        tag = str(item.get("tag") or "")
+        course_id = tag[len("courseId"):] if tag.startswith("courseId") else ""
+        class_id = ""
+        for receiver in item.get("receiverArray") or []:
+            if isinstance(receiver, dict) and receiver.get("clazzId"):
+                class_id = str(receiver["clazzId"])
+                break
+        return {
+            "uuid": item.get("uuid"),
+            "title": item.get("title"),
+            "content": item.get("content"),
+            "creater_name": item.get("createrName"),
+            "course_id": course_id,
+            "class_id": class_id,
+            "source_type": item.get("sourceType"),
+            "source": item.get("source"),
+            "insert_time": item.get("insertTime"),
+            "send_time": item.get("sendTime"),
+            "is_read": item.get("isread"),
+            "seen_at": int(datetime.now().timestamp() * 1000),
+        }
 
     def save_notices_db(self):
+        """保存通知列表中尚未入库的记录，返回新增条数"""
+        notices = ((self.notice_res or {}).get("notices") or {}).get("list") or []
         new_count = 0
-        for item in self.notice_res['notices']['list']:
-            record = {
-                "uuid": item["uuid"],
-                "completeTime": item["completeTime"],
-                "content": item["content"],
-                "createrName": item["createrName"],
-                "insertTime": item["insertTime"],
-                "isRead": item["isread"],
-                "sendTime": item["sendTime"],
-                "title": item["title"]
-            }
-            if not self.notices_db.contains(self.notices_db_query.uuid == record["uuid"]):
-                self.notices_db.insert(record)
-                new_count += 1
+        for item in notices:
+            uuid = str(item.get("uuid") or "")
+            if not uuid:
+                continue
+            if self.notice_table.contains(self.query.uuid == uuid):
+                continue
+            self.notice_table.insert(self._notice_record(item))
+            new_count += 1
         return new_count
 
     def look_up_notices_by_isRead(self, isRead):
-        """按已读/未读状态查询，返回查询结果列表"""
-        isRead = int(isRead)
-        return self.notices_db.search(self.notices_db_query.isRead == isRead)
+        """按已读状态查询通知"""
+        return self.notice_table.search(self.query.is_read == int(isRead))
 
     def look_up_notices_by_timestamp(self, startTime, endTime):
         """按时间区间查询通知，区间不得短于一天
@@ -239,11 +314,75 @@ class NoticesDB:
         if endTimestamp - startTimestamp < oneDayTimestamp:
             logger.error("可查询的最短时间间隔为一天")
             return []
-        return self.notices_db.search((self.notices_db_query.insertTime > startTimestamp) &
-                                      (self.notices_db_query.insertTime < endTimestamp))
+        return self.notice_table.search((self.query.insert_time > startTimestamp) &
+                                        (self.query.insert_time < endTimestamp))
 
     def look_up_all(self):
-        return self.notices_db.all()
+        return self.notice_table.all()
+
+    # ---------- 课程活动 ----------
+
+    def save_actives(self, actives, course_id, class_id):
+        """保存活动列表，返回首次出现的活动记录
+
+        actives 为活动接口返回的 activeList；已存在的活动更新 status、
+        end_time、remaining、last_seen 四个字段。
+        """
+        new_actives = []
+        now = int(datetime.now().timestamp() * 1000)
+        for item in actives or []:
+            active_id = str(item.get("id") or "")
+            if not active_id:
+                continue
+            status = item.get("status")
+            end_time = item.get("endTime")
+            remaining = item.get("nameFour")
+            if self.active_table.contains(self.query.active_id == active_id):
+                self.active_table.update(
+                    {"status": status, "end_time": end_time,
+                     "remaining": remaining, "last_seen": now},
+                    self.query.active_id == active_id)
+                continue
+            record = {
+                "active_id": active_id,
+                "active_type": item.get("activeType"),
+                "name": item.get("nameOne"),
+                "course_id": str(course_id or ""),
+                "class_id": str(class_id or ""),
+                "start_time": item.get("startTime"),
+                "end_time": end_time,
+                "status": status,
+                "user_status": item.get("userStatus"),
+                "remaining": remaining,
+                "pushed": False,
+                "last_seen": now,
+            }
+            self.active_table.insert(record)
+            new_actives.append(record)
+        return new_actives
+
+    def is_active_pushed(self, active_id):
+        record = self.active_table.get(self.query.active_id == str(active_id))
+        return bool(record and record.get("pushed"))
+
+    def mark_active_pushed(self, active_id):
+        self.active_table.update({"pushed": True}, self.query.active_id == str(active_id))
+
+    # ---------- 维护 ----------
+
+    def prune(self, days=30):
+        """删除超过指定天数的通知与活动，返回删除条数"""
+        deadline = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        removed = 0
+        removed += len(self.notice_table.remove(self.query.insert_time < deadline))
+        removed += len(self.active_table.remove(self.query.end_time < deadline))
+        return removed
+
+    def stats(self):
+        return {"notices": len(self.notice_table), "actives": len(self.active_table)}
 
     def close_db(self):
-        self.notices_db.close()
+        try:
+            self.db.close()
+        except Exception as e:
+            logger.warning(f"关闭数据库时出错(已忽略):{e}")
